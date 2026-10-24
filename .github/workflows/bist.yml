@@ -1,0 +1,99 @@
+name: BIST-InStock
+
+"on":
+  workflow_dispatch:
+    inputs:
+      evren:
+        description: "Kodun içindeki hangi hisse listesi taransın?"
+        type: choice
+        required: true
+        default: bist30
+        options:
+          - bist30
+          - bist100
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bist-instock-manuel
+  cancel-in-progress: false
+
+jobs:
+  tarama:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Europe/Istanbul
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Python hazirla
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Proje klasorunu bul
+        id: proje
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, stat, zipfile
+          from pathlib import Path, PurePosixPath
+
+          roots = [Path("."), Path("bist-instock")]
+          projects = [p.resolve() for p in roots if (p / "bist/job/run_strategies.py").is_file()]
+          if not projects:
+              matches = []
+              for archive in sorted(Path(".").glob("*.zip")):
+                  with zipfile.ZipFile(archive) as z:
+                      members = [n for n in z.namelist() if n.endswith("bist/job/run_strategies.py")]
+                  if len(members) == 1:
+                      matches.append((archive, members[0]))
+              if len(matches) != 1:
+                  raise SystemExit("Proje bulunamadi. Dosyalari veya BIST-InStock ZIP dosyasini deponun ana dizinine yukleyin.")
+              archive, entry = matches[0]
+              destination = Path(os.environ["RUNNER_TEMP"]) / "bist-instock-kaynak"
+              with zipfile.ZipFile(archive) as z:
+                  if sum(i.file_size for i in z.infolist()) > 100 * 1024 * 1024:
+                      raise SystemExit("ZIP dosyasinin acilmis boyutu 100 MB sinirini asiyor.")
+                  for item in z.infolist():
+                      p = PurePosixPath(item.filename)
+                      if p.is_absolute() or ".." in p.parts or stat.S_ISLNK(item.external_attr >> 16):
+                          raise SystemExit("ZIP dosyasinda gecersiz dosya yolu var.")
+                  z.extractall(destination)
+              projects = [(destination / PurePosixPath(entry).parent.parent.parent).resolve()]
+          project = projects[0]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write("dir=" + str(project) + "\n")
+          print("Proje klasoru hazir.")
+          PY
+
+      - name: Tarama kutuphanelerini kur
+        run: >-
+          python -m pip install --disable-pip-version-check -q
+          "numpy>=1.26,<3" "pandas>=2.2,<3" "yfinance==1.7.0"
+          "tqdm>=4.66,<5" "requests>=2.31,<3"
+
+      - name: Stratejileri tara
+        working-directory: ${{ steps.proje.outputs.dir }}
+        env:
+          EVREN: ${{ inputs.evren }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          python -u -m bist.job.run_strategies --universe "$EVREN" 2>&1 | tee data/tarama.log
+
+      - name: Sonuclari indirilebilir yap
+        if: ${{ always() && steps.proje.outputs.dir != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: BIST-InStock-Sonuclar-${{ github.run_number }}
+          path: ${{ steps.proje.outputs.dir }}/data/
+          if-no-files-found: warn
+          retention-days: 7
